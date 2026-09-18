@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# The acceptance run installs a real third-party MCP server and writes a
+# sandbox next to itself. Both are generated; neither is committed.
+tests/acceptance/node_modules/
+tests/acceptance/package-lock.json
+tests/acceptance/package.json
+tests/acceptance/sandbox/
+tests/acceptance/gw.json
+
+# A local gateway config names real paths and may carry real tokens in "env".
+cloakllm-gateway.json

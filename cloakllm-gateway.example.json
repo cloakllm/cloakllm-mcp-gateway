@@ -1,0 +1,17 @@
+{
+  "upstreams": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "set-this-in-your-own-config"
+      }
+    }
+  },
+  "log_level": "info",
+  "request_timeout": 120
+}

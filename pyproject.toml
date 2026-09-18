@@ -1,0 +1,55 @@
+[project]
+name = "cloakllm-mcp-gateway"
+version = "0.1.0.dev0"
+description = "A CloakLLM sanitizing proxy between an MCP client and other MCP servers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "The CloakLLM Authors", email = "cloakllm@gmail.com"}]
+keywords = ["llm", "pii", "mcp", "privacy", "compliance", "proxy", "gateway"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+]
+
+# M0 is pure plumbing and deliberately has no runtime dependencies -- it is a
+# JSON-RPC proxy and nothing more. cloakllm itself arrives at M1, when there
+# is something to sanitize with it. Keeping the dependency out until then
+# means the transparency baseline cannot be contaminated by the SDK's own
+# behaviour.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
+
+[project.scripts]
+cloakllm-gateway = "cloakllm_gateway.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/cloakllm/cloakllm-mcp-gateway"
+Repository = "https://github.com/cloakllm/cloakllm-mcp-gateway"
+Issues = "https://github.com/cloakllm/cloakllm-mcp-gateway/issues"
+
+[tool.setuptools.packages.find]
+include = ["cloakllm_gateway*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import mode and rootdir matter here: tests/conftest.py is imported by name
+# from the test modules, so the repo root has to be on sys.path.
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
