@@ -62,13 +62,15 @@ DETECTION_OPTIONS = frozenset({
 class GatewayConfig:
     def __init__(self, upstreams, log_level="info",
                  allow_unknown_protocol_version=False,
-                 request_timeout=120.0, sanitize=True, detection=None):
+                 request_timeout=120.0, sanitize=True, detection=None,
+                 token_scope="session"):
         self.upstreams = upstreams
         self.log_level = log_level
         self.allow_unknown_protocol_version = allow_unknown_protocol_version
         self.request_timeout = request_timeout
         self.sanitize = sanitize
         self.detection = detection or {}
+        self.token_scope = token_scope
 
 
 def _require(obj, key, kind, where):
@@ -155,8 +157,17 @@ def parse(data):
     if "ner_entity_types" in detection:
         detection = dict(detection, ner_entity_types=set(detection["ner_entity_types"]))
 
+    # "session": a token minted from one upstream's data can be restored in
+    # a call to any other. That is what lets a model read with one tool and
+    # write with another, and it is also how the gateway can be made to hand
+    # one server's data to a different one. "upstream" refuses that.
+    token_scope = data.get("token_scope", "session")
+    if token_scope not in ("session", "upstream"):
+        raise ConfigError('token_scope must be "session" or "upstream"')
+
     return GatewayConfig(upstreams, log_level, allow_unknown,
-                         float(request_timeout), sanitize, detection)
+                         float(request_timeout), sanitize, detection,
+                         token_scope)
 
 
 def find_path(explicit=None):

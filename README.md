@@ -18,19 +18,19 @@ The model never sees the PII; the downstream tool still works.
 
 ---
 
-## Status: M2 — the round trip works. Not yet released.
+## Status: M3 — the leak-probe gate passes. One milestone from release.
 
-This is an early, unreleased repo. **The full loop is closed: the model sees
-`[EMAIL_0]`, the downstream tool receives the real address.** The remaining
-milestones are the leak-probe gate and the audit chain, and the release gate is
-M3 — so do not deploy this in anger yet.
+**The full loop is closed and probed:** the model sees `[EMAIL_0]`, the
+downstream tool receives the real address, and a leak probe plants PII across
+every surface it can reach — including content types invented for the test —
+and finds none of it getting out. M4 (the audit chain) remains.
 
 | Milestone | State |
 |---|---|
 | **M0** — transparent proxy, zero logic | **done** |
 | **M1** — sanitize tool results | **done** |
 | **M2** — desanitize tool arguments | **done** |
-| M3 — deny-by-default walker + tripwire (**release gate**) | not started |
+| **M3** — deny-by-default walker + tripwire (**release gate**) | **done** |
 | M4 — hash-chained audit log | not started |
 
 The round trip is proved against a real server, on disk rather than through the
@@ -80,6 +80,46 @@ The walker **sanitizes every string by default** and skips only `type`,
 correlation identities and base64 binary, whose exact bytes must survive. A
 field this gateway has never heard of is therefore sanitized, not ignored.
 Every skip is counted, so M3's tripwire has an explicit list of surfaces.
+
+### The tripwire
+
+After the typed pass, a second walker goes over the **entire** payload and runs
+a **regex-only** detection pass on every string — and on every dictionary
+**key**. If deterministic high-confidence PII survived, it is scrubbed and a
+warning is logged once (never containing the value).
+
+It is not a redundant layer. On the leak probe's payload the typed pass leaks
+one value and the tripwire catches it: a `structuredContent` dictionary *keyed*
+by an email address. The typed walker rewrites values only, because renaming a
+protocol key would change the shape the client parses — and nothing else was
+covering that case.
+
+Regex-only is what makes it safe to run on everything: no NER means no name or
+organisation false positives on ids, mime types or URLs, so structural strings
+are never touched. It is **fail-open** by construction — any error leaves the
+typed result, which already ran, exactly as it was.
+
+**Binary content is not scanned, and that is a limit rather than an oversight.**
+Regex cannot find a card number inside a JPEG — the bytes are not there as text
+— while a chance digit run in the base64 alphabet would corrupt the image for
+nothing. **A screenshot of a credit card passes through this gateway.**
+
+### Moving data between servers
+
+If you run several servers behind one gateway, tokenization creates a path that
+did not exist before: `fs` returns a customer record, the model sees
+`[EMAIL_0]` and passes it to a third-party server, and the gateway restores the
+real address for it. The model could not have done that before — it never had
+the value. **Tokenization made the value portable without making it visible.**
+
+The gateway tracks which upstream each token came from. `token_scope` decides
+what happens:
+
+- `"session"` (default) — allowed, and logged. Reading with one tool and
+  writing with another is a real workflow and the main reason to put several
+  servers behind one gateway.
+- `"upstream"` — refused. A token only resolves in a call to the server whose
+  data it stands for.
 
 ### Two things worth knowing about the round trip
 
@@ -145,7 +185,11 @@ These are properties of the design, not gaps to be closed later.
    result is not free — see the table above.
 6. **Detection is not perfect, and the guarantee is only as good as it is.**
    The SDK measures roughly 97% character-level scrub on deliberately hard
-   inputs. This gateway inherits exactly that, no better.
+   inputs. This gateway inherits exactly that, no better — including its
+   false positives.
+7. **Images and audio are not inspected.** A screenshot of a card, or a scanned
+   document, reaches the model unchanged. See the tripwire section for why
+   scanning base64 would cost false positives and buy no protection.
 
 One more, specific to M0: **the gateway will not bridge two upstreams that
 negotiate different MCP protocol versions.** It refuses the handshake and says

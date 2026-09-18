@@ -96,13 +96,21 @@ class Session:
     project has already paid for once.
     """
 
-    def __init__(self, shield):
+    def __init__(self, shield, token_scope="session"):
         self._shield = shield
         self._token_map = None
         # Shield.sanitize mutates the shared map, and tool results arrive on
         # one reader thread per upstream. Without this, two concurrent calls
         # can both allocate [EMAIL_0] for different addresses.
         self._lock = threading.Lock()
+        self.token_scope = token_scope
+        # Which upstream's data each token stands for. See _check_provenance
+        # for what this is actually defending against.
+        self._origin = {}
+
+    @property
+    def shield(self):
+        return self._shield
 
     @property
     def token_map(self):
@@ -123,14 +131,44 @@ class Session:
 
     # ------------------------------------------------------------- walking
 
-    def sanitize_payload(self, payload):
+    def sanitize_payload(self, payload, origin=None):
         """Return a sanitized copy of an arbitrary JSON payload.
 
         Raises SanitizationFailed if any part of it could not be handled, so
         the caller can refuse the whole message rather than forward some of
         it unprotected.
+
+        `origin` is the upstream whose data this is, recorded per token so
+        that a later request can be checked against it.
         """
-        return self._transform(payload, self.sanitize_text, "sanitize")
+        out, stats = self._transform(payload, self.sanitize_text, "sanitize")
+        if origin is not None:
+            for token in _tokens_in(out):
+                self._origin.setdefault(token, origin)
+        return out, stats
+
+    def origin_of(self, token):
+        """Which upstream's data a token stands for, or None if unknown."""
+        return self._origin.get(token)
+
+    def tokens_from_other_upstreams(self, payload, target):
+        """Tokens in an outbound payload that stand for another server's data.
+
+        This is the exfiltration path the round trip creates, and it is not
+        obvious. Suppose `fs` returns a customer record and the model sees
+        [EMAIL_0]. The model then calls a third-party search or
+        issue-tracker server with [EMAIL_0] in the arguments. The gateway
+        dutifully restores it, and the address the model was never allowed
+        to see is handed to a party that was never meant to have it -- with
+        the gateway itself performing the exfiltration.
+
+        Before the gateway, the model could not have done this: it never
+        had the value. Tokenization is what made the value *portable*
+        without being *visible*. That is a new capability and it needs to
+        be visible to the operator.
+        """
+        return sorted({t for t in _tokens_in(payload)
+                       if self._origin.get(t) not in (None, target)})
 
     def desanitize_payload(self, payload):
         """Return a copy with tokens restored to the values they stand for.
@@ -227,6 +265,31 @@ _SELF_TEST_PROBES = (
     ("detect_api_keys", "AKIAIOSFODNN7EXAMPLE"),
     ("detect_ssns", "123-45-6789"),
 )
+
+
+def tokens_in(node):
+    """Every CloakLLM token appearing anywhere in a payload."""
+    found = set()
+    for text in _strings(node):
+        found.update(_TOKEN_RE.findall(text))
+    return found
+
+
+_tokens_in = tokens_in
+
+
+def _token_regex():
+    # Prefer the SDK's canonical pattern so the two cannot drift; fall back
+    # to the documented [CATEGORY_N] shape if that module ever moves.
+    try:
+        from cloakllm.token_spec import CLOAKLLM_TOKEN_REGEX
+        return CLOAKLLM_TOKEN_REGEX
+    except Exception:  # pragma: no cover - the SDK always ships it today
+        import re
+        return re.compile(r"\[[A-Z][A-Z0-9_]*_\d+\]")
+
+
+_TOKEN_RE = _token_regex()
 
 
 def _strings(node, key=None):

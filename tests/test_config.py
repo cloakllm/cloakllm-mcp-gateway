@@ -48,6 +48,13 @@ def test_detection_must_be_an_object():
         config_mod.parse(_ok(detection=["detect_emails"]))
 
 
+def test_token_scope_defaults_to_session_and_rejects_anything_else():
+    assert config_mod.parse(_ok()).token_scope == "session"
+    assert config_mod.parse(_ok(token_scope="upstream")).token_scope == "upstream"
+    with pytest.raises(ConfigError, match="token_scope must be"):
+        config_mod.parse(_ok(token_scope="global"))
+
+
 def test_sanitize_must_be_a_boolean():
     with pytest.raises(ConfigError, match="sanitize must be a boolean"):
         config_mod.parse(_ok(sanitize="yes"))

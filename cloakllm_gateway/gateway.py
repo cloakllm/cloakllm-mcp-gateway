@@ -29,7 +29,7 @@ import itertools
 import threading
 import time
 
-from . import jsonrpc, log, sanitizer
+from . import jsonrpc, log, sanitizer, tripwire
 from .upstream import Upstream, UpstreamError, UpstreamRequestError
 
 GATEWAY_NAME = "cloakllm-gateway"
@@ -71,6 +71,7 @@ class Gateway:
         self._upstream_id_index = {}    # (upstream name, _key(id)) -> gw id
 
         self._session = None        # built in run(), once, before serving
+        self._tripwire = _NoTripwire()
         self._resource_owner = {}   # uri -> upstream name
         self._initialized = False
         self._protocol_version = None
@@ -100,7 +101,8 @@ class Gateway:
                 # address the model never saw, and M2 would then desanitize
                 # it straight into a real tool call.
                 sanitizer.self_test(sanitizer.Session(shield), self.config.detection)
-                session = sanitizer.Session(shield)
+                session = sanitizer.Session(shield, self.config.token_scope)
+                self._tripwire = tripwire.OutboundTripwire(session)
             except Exception as exc:  # noqa: BLE001
                 log.error("cannot start: %s" % exc)
                 return 1
@@ -213,6 +215,10 @@ class Gateway:
             # the model invented, so the warning would fire on completely
             # normal operation and be trained away within a day.
             self._warn_on_fresh_pii(method, params)
+            # Captured before the restore, while tokens are still tokens.
+            # The destination is only known after routing, so the two halves
+            # of the provenance check happen either side of it.
+            carried_tokens = sanitizer.tokens_in(params)
             try:
                 params, _ = self._session.desanitize_payload(params)
             except sanitizer.SanitizationFailed as exc:
@@ -229,7 +235,55 @@ class Gateway:
             self._client.write(jsonrpc.error_response(msg_id, **target))
             return
         upstream, params = target
+
+        if self._session is not None and carried_tokens:
+            refusal = self._check_token_provenance(
+                msg_id, method, carried_tokens, upstream.name)
+            if refusal:
+                return
+
         self._forward_client_request(upstream, msg, params)
+
+    def _check_token_provenance(self, msg_id, method, carried, target):
+        """Is the model moving one server's data into a call to another?
+
+        This is the exfiltration path the round trip creates, and it is
+        easy to miss. `fs` returns a customer record, the model sees
+        [EMAIL_0], and the model then calls a third-party search server
+        with [EMAIL_0] in its arguments. The gateway restores it, and an
+        address the model was never allowed to see is handed to a party
+        that was never meant to have it -- with the gateway itself doing
+        the handing over.
+
+        Before the gateway the model could not have done that: it never
+        had the value. Tokenization made the value portable without making
+        it visible, and that is a capability the operator has to be able
+        to see, and to switch off.
+
+        Returns True if the request was refused.
+        """
+        foreign = sorted(t for t in carried
+                         if self._session.origin_of(t) not in (None, target))
+        if not foreign:
+            return False
+
+        # Token names carry no PII -- "EMAIL_0" says a category, not a value.
+        detail = ", ".join(foreign[:5])
+        if self._session.token_scope == "upstream":
+            log.warn("refused %s to %r: it carries %d token(s) standing for "
+                     "another server's data (%s), and token_scope is "
+                     "\"upstream\"" % (method, target, len(foreign), detail))
+            self._client.write(jsonrpc.error_response(
+                msg_id, jsonrpc.INVALID_PARAMS,
+                "this call carries data from a different upstream server, "
+                "which token_scope=\"upstream\" does not allow"))
+            return True
+
+        log.warn("%s to %r carries %d token(s) standing for another server's "
+                 "data (%s). The real values are being restored for it. Set "
+                 "token_scope to \"upstream\" to refuse this instead."
+                 % (method, target, len(foreign), detail))
+        return False
 
     def _warn_on_fresh_pii(self, method, params):
         """Surface PII the model wrote out itself, rather than a token.
@@ -750,16 +804,21 @@ class Gateway:
         if self._session is None or method not in sanitizer.SANITIZED_METHODS:
             return msg
 
+        origin = up.name if up is not None else None
         out = dict(msg)
         try:
             if "result" in out:
-                out["result"], stats = self._session.sanitize_payload(out["result"])
+                out["result"], stats = self._session.sanitize_payload(
+                    out["result"], origin=origin)
+                out["result"], _ = self._tripwire.scrub(out["result"])
             elif "error" in out:
                 # Error bodies are not an afterthought: the real filesystem
                 # server puts the requested path in its "file not found"
                 # message, so a failed call leaks exactly what a successful
                 # one would have.
-                out["error"], stats = self._session.sanitize_payload(out["error"])
+                out["error"], stats = self._session.sanitize_payload(
+                    out["error"], origin=origin)
+                out["error"], _ = self._tripwire.scrub(out["error"])
             else:
                 return msg
         except sanitizer.SanitizationFailed as exc:
@@ -831,3 +890,12 @@ def _key(value):
 def _version():
     from . import __version__
     return __version__
+
+
+class _NoTripwire:
+    """Stands in before the session exists, and when sanitization is off."""
+
+    hits = 0
+
+    def scrub(self, payload):
+        return payload, 0
