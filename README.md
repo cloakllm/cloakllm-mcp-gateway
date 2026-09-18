@@ -18,28 +18,80 @@ The model never sees the PII; the downstream tool still works.
 
 ---
 
-## Status: M0 — transparent proxy. No sanitization yet.
+## Status: M1 — tool results are sanitized. Not yet released.
 
-This is an early, unreleased repo. **Today it proxies; it does not protect.**
-Do not deploy it expecting PII protection.
+This is an early, unreleased repo. **PII flowing *from* a server to the model is
+removed; PII the model sends back in tool arguments is not yet restored, so the
+round trip is incomplete.** Do not deploy it in anger yet.
 
 | Milestone | State |
 |---|---|
 | **M0** — transparent proxy, zero logic | **done** |
-| M1 — sanitize tool results | not started |
+| **M1** — sanitize tool results | **done** |
 | M2 — desanitize tool arguments | not started |
 | M3 — deny-by-default walker + tripwire (**release gate**) | not started |
 | M4 — hash-chained audit log | not started |
 
-M0 exists so that when M1 starts rewriting payloads there is a proven-transparent
-baseline to diff against: from here on, any difference the client can observe is
-one a later milestone made on purpose, not plumbing damage.
+Behaviour is measured against a real third-party server, not asserted.
+`tests/acceptance/real_server.py` runs the same session three ways — straight at
+`@modelcontextprotocol/server-filesystem`, through the gateway with
+sanitization off, and through it with sanitization on — and diffs the
+transcripts, including every tool's full `inputSchema` byte for byte.
 
-Transparency is measured, not asserted. `tests/acceptance/m0_real_server.py`
-runs the same session twice against the real
-`@modelcontextprotocol/server-filesystem` — once directly, once through the
-gateway — and diffs the transcripts, including every tool's full `inputSchema`
-byte for byte.
+Running all three is what makes either claim checkable. The transparent pass
+proves the gateway changes nothing it did not mean to; the protecting pass
+proves the one thing it changes is the PII. Neither is worth much alone — a
+gateway that mangled everything would pass the second, and one that did nothing
+would pass the first.
+
+### What M1 does and does not touch
+
+Sanitized: `tools/call`, `resources/read` and `prompts/get` payloads — results
+**and** JSON-RPC error bodies, because the real filesystem server puts the
+requested path in its "file not found" message, so a failed call leaks exactly
+what a successful one would have.
+
+Not sanitized: `tools/list` and the other schema-bearing responses. Rewriting a
+tool description or an enum inside an `inputSchema` corrupts the contract the
+model calls against, for no privacy gain.
+
+The walker **sanitizes every string by default** and skips only a small,
+principled set — `type`, `mimeType`, `uri`, `uriTemplate`, `progressToken`,
+`data`, `blob` — all of them protocol discriminators, routing identities or
+base64 binary, whose exact bytes must survive. A field this gateway has never
+heard of is therefore sanitized, not ignored. Every skip is counted, so M3's
+tripwire has an explicit list of surfaces to scan.
+
+**Known M1 gap, recorded rather than hidden:** a `uri` carrying PII still
+reaches the model, because tokenizing one needs M2's return path to put it back.
+A test asserts the gap, so closing it in M2 has to be a deliberate act rather
+than something anyone remembers to do.
+
+### Detection defaults
+
+The SDK enables every NER label it knows. This gateway defaults to **PERSON
+only**, because a gateway tokenizes what the model then has to reason over: with
+the full set, *"what is the capital of France"* reaches the model as *"the
+capital of `[GPE_0]`"* and the answer is gone. `France` and `Acme Corp` identify
+nobody. Widen it with `detection.ner_entity_types` if you want the SDK's
+behaviour.
+
+Note that narrowing the NER set changes **what** is tokenized, not what it
+costs — the model still runs.
+
+### Latency
+
+Measured on one developer machine, so treat these as an order of magnitude
+rather than a benchmark. Per sanitized payload:
+
+| Payload | Median |
+|---|---|
+| 500 chars | ~12 ms |
+| 5 KB | ~86 ms |
+| 50 KB | ~900 ms |
+
+It is superlinear, and it lands on every tool call. A tool that returns whole
+files will feel it.
 
 ---
 
@@ -60,7 +112,10 @@ These are properties of the design, not gaps to be closed later.
 4. **It does not solve prompt injection via tool results.** Adjacent problem,
    different mechanism. No coverage is implied.
 5. **Latency lands on every tool call.** A detection pass over a large file
-   result is not free. Measured from M1 onward.
+   result is not free — see the table above.
+6. **Detection is not perfect, and the guarantee is only as good as it is.**
+   The SDK measures roughly 97% character-level scrub on deliberately hard
+   inputs. This gateway inherits exactly that, no better.
 
 One more, specific to M0: **the gateway will not bridge two upstreams that
 negotiate different MCP protocol versions.** It refuses the handshake and says
@@ -71,7 +126,8 @@ which upstream diverged, rather than quietly translating between dialects.
 ## Install and run
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[detection]"        # omit [detection] for regex categories only
+python -m spacy download en_core_web_sm
 ```
 
 Write a config naming the servers to put behind the gateway
@@ -84,9 +140,21 @@ Write a config naming the servers to put behind the gateway
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
     }
-  }
+  },
+  "sanitize": true,
+  "detection": { "detect_ip_addresses": false }
 }
 ```
+
+An unknown key under `detection` is rejected rather than ignored: a typo there
+is the worst failure available, because the operator believes a category is on
+when it is not.
+
+On startup the gateway runs known values of every enabled category through the
+real detection path and **refuses to start if any survives**. Constructing a
+detector is not evidence that it detects — a spaCy model that failed to load
+produces a perfectly healthy-looking object that sanitizes nothing, and the
+gateway would otherwise come up announcing protection it was not providing.
 
 Check it without serving:
 
@@ -145,7 +213,7 @@ For the acceptance run against a real third-party server:
 ```bash
 cd tests/acceptance
 npm install @modelcontextprotocol/server-filesystem
-python m0_real_server.py
+python real_server.py
 ```
 
 ## Design notes

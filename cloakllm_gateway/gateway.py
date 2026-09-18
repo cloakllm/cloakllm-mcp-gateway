@@ -29,7 +29,7 @@ import itertools
 import threading
 import time
 
-from . import jsonrpc, log
+from . import jsonrpc, log, sanitizer
 from .upstream import Upstream, UpstreamError, UpstreamRequestError
 
 GATEWAY_NAME = "cloakllm-gateway"
@@ -70,6 +70,7 @@ class Gateway:
         self._client_id_index = {}      # _key(client id) -> gw id
         self._upstream_id_index = {}    # (upstream name, _key(id)) -> gw id
 
+        self._session = None        # built in run(), once, before serving
         self._resource_owner = {}   # uri -> upstream name
         self._initialized = False
         self._protocol_version = None
@@ -83,6 +84,32 @@ class Gateway:
 
     def run(self):
         """Read the client until it closes. Returns a process exit code."""
+        # Built before anything is served, not lazily on the first tool call:
+        # loading a detection model takes seconds, and a broken detection
+        # config should stop the gateway at startup rather than surface as a
+        # failed tool call later. Refusing to start is the fail-closed
+        # reading of "sanitization is enabled but unavailable".
+        if self.config.sanitize:
+            try:
+                shield = sanitizer.build_shield(self.config.detection)
+                # Constructing a Shield proves nothing about whether it
+                # detects anything. Prove it before announcing protection --
+                # but on a THROWAWAY session, never the one that will serve
+                # traffic. The probe's own values consume tokens, so running
+                # it on the live session would leave [EMAIL_0] bound to an
+                # address the model never saw, and M2 would then desanitize
+                # it straight into a real tool call.
+                sanitizer.self_test(sanitizer.Session(shield), self.config.detection)
+                session = sanitizer.Session(shield)
+            except Exception as exc:  # noqa: BLE001
+                log.error("cannot start: %s" % exc)
+                return 1
+            self._session = session
+            log.info("sanitization enabled")
+        else:
+            log.warn("sanitization is DISABLED; this is a plain proxy and "
+                     "PII will reach the model unchanged")
+
         for name, up in self.upstreams.items():
             try:
                 up.start()
@@ -612,12 +639,10 @@ class Gateway:
                 log.debug("%s: response to unknown request %r; dropped"
                           % (up.name, msg.get("id")))
                 return
-            _, client_id, _method = entry
+            _, client_id, method = entry
             restored = dict(msg)
             restored["id"] = client_id
-            # M1 hooks in here: this is where a tools/call result is
-            # sanitized before it reaches the client and, through it, the model.
-            self._client.write(restored)
+            self._client.write(self._sanitize_response(restored, method, up))
             return
 
         if jsonrpc.is_request(msg):
@@ -636,6 +661,42 @@ class Gateway:
 
         if jsonrpc.is_notification(msg):
             self._on_upstream_notification(up, msg)
+
+    def _sanitize_response(self, msg, method, up):
+        """Sanitize a response on its way to the client, and so to the model.
+
+        Fails CLOSED: if sanitization cannot complete, the client gets an
+        error instead of the payload. Losing a tool call is bad; leaking the
+        PII this exists to prevent is worse. The audit path (M4) will fail
+        OPEN, for the opposite reason.
+        """
+        if self._session is None or method not in sanitizer.SANITIZED_METHODS:
+            return msg
+
+        out = dict(msg)
+        try:
+            if "result" in out:
+                out["result"], stats = self._session.sanitize_payload(out["result"])
+            elif "error" in out:
+                # Error bodies are not an afterthought: the real filesystem
+                # server puts the requested path in its "file not found"
+                # message, so a failed call leaks exactly what a successful
+                # one would have.
+                out["error"], stats = self._session.sanitize_payload(out["error"])
+            else:
+                return msg
+        except sanitizer.SanitizationFailed as exc:
+            log.error("%s: sanitization failed for %s, refusing to forward "
+                      "the payload: %s" % (up.name, method, exc))
+            return jsonrpc.error_response(
+                msg.get("id"), jsonrpc.INTERNAL_ERROR,
+                "cloakllm-gateway could not sanitize this %s response and "
+                "refused to forward it" % method)
+
+        if stats.changed:
+            log.info("%s: %s -- redacted %d of %d strings"
+                     % (up.name, method, stats.changed, stats.sanitized))
+        return out
 
     def _on_upstream_notification(self, up, msg):
         method = msg.get("method")

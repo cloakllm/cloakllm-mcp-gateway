@@ -25,6 +25,42 @@ def test_a_minimal_config_parses():
     assert [u.name for u in cfg.upstreams] == ["fs"]
     assert cfg.upstreams[0].args == ["server.js"]
     assert cfg.allow_unknown_protocol_version is False
+    # The product default, asserted here because the test harness
+    # deliberately flips it off for speed.
+    assert cfg.sanitize is True
+
+
+def test_an_unknown_detection_option_is_rejected():
+    # Silently ignoring a typo is the worst failure mode available here:
+    # the operator believes a category is switched on and it is not.
+    with pytest.raises(ConfigError, match="unknown detection option"):
+        config_mod.parse(_ok(detection={"detect_emailz": False}))
+
+
+def test_known_detection_options_are_accepted():
+    cfg = config_mod.parse(_ok(detection={"detect_ip_addresses": True,
+                                          "locale": "fr"}))
+    assert cfg.detection == {"detect_ip_addresses": True, "locale": "fr"}
+
+
+def test_detection_must_be_an_object():
+    with pytest.raises(ConfigError, match="detection must be an object"):
+        config_mod.parse(_ok(detection=["detect_emails"]))
+
+
+def test_sanitize_must_be_a_boolean():
+    with pytest.raises(ConfigError, match="sanitize must be a boolean"):
+        config_mod.parse(_ok(sanitize="yes"))
+
+
+def test_the_detection_allow_list_excludes_the_gateway_s_own_settings():
+    # audit_enabled, log_dir and the attestation fields belong to the
+    # gateway, not to an operator's detection block: silently redirecting
+    # the SDK's audit chain from a proxy config would be a surprising way
+    # to lose a log.
+    for owned in ("audit_enabled", "log_dir", "attestation_key",
+                  "compliance_mode", "deployer_id"):
+        assert owned not in config_mod.DETECTION_OPTIONS
 
 
 def test_an_underscore_in_an_upstream_name_is_rejected():

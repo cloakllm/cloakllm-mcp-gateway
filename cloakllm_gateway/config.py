@@ -46,14 +46,29 @@ class UpstreamSpec:
         return "UpstreamSpec(%r, %r)" % (self.name, self.command)
 
 
+# Detection options an operator may set. Deliberately a subset of
+# ShieldConfig: the fields it leaves out (audit_enabled, log_dir,
+# attestation_key, compliance_mode, ...) are the gateway's to own, and an
+# operator silently redirecting the SDK's audit chain from a proxy config
+# would be a surprising way to lose a log.
+DETECTION_OPTIONS = frozenset({
+    "locale", "spacy_model", "ner_entity_types", "ner_required",
+    "detect_emails", "detect_phones", "detect_ssns", "detect_credit_cards",
+    "detect_api_keys", "detect_ip_addresses", "detect_iban",
+    "custom_patterns", "mode", "descriptive_tokens", "max_input_length",
+})
+
+
 class GatewayConfig:
     def __init__(self, upstreams, log_level="info",
                  allow_unknown_protocol_version=False,
-                 request_timeout=120.0):
+                 request_timeout=120.0, sanitize=True, detection=None):
         self.upstreams = upstreams
         self.log_level = log_level
         self.allow_unknown_protocol_version = allow_unknown_protocol_version
         self.request_timeout = request_timeout
+        self.sanitize = sanitize
+        self.detection = detection or {}
 
 
 def _require(obj, key, kind, where):
@@ -122,7 +137,26 @@ def parse(data):
     if not isinstance(request_timeout, (int, float)) or request_timeout <= 0:
         raise ConfigError("request_timeout must be a positive number")
 
-    return GatewayConfig(upstreams, log_level, allow_unknown, float(request_timeout))
+    sanitize = data.get("sanitize", True)
+    if not isinstance(sanitize, bool):
+        raise ConfigError("sanitize must be a boolean")
+
+    detection = data.get("detection", {})
+    if not isinstance(detection, dict):
+        raise ConfigError("detection must be an object")
+    # Reject unknown keys rather than ignoring them. A typo in a detection
+    # setting is the worst kind of silent failure here: the operator
+    # believes a category is switched on and it is not.
+    unknown = sorted(set(detection) - DETECTION_OPTIONS)
+    if unknown:
+        raise ConfigError(
+            "unknown detection option(s): %s. Supported: %s"
+            % (", ".join(unknown), ", ".join(sorted(DETECTION_OPTIONS))))
+    if "ner_entity_types" in detection:
+        detection = dict(detection, ner_entity_types=set(detection["ner_entity_types"]))
+
+    return GatewayConfig(upstreams, log_level, allow_unknown,
+                         float(request_timeout), sanitize, detection)
 
 
 def find_path(explicit=None):

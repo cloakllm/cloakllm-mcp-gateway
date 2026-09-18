@@ -34,24 +34,27 @@ jobs:
       - name: Upgrade pip and setuptools
         run: pip install --upgrade pip setuptools
       - name: Install
-        run: pip install -e ".[dev]"
-      - name: Assert the gateway has no runtime dependencies
         run: |
-          # M0 is a JSON-RPC proxy and nothing more. cloakllm itself arrives
-          # at M1; until then a runtime dep appearing here means something
-          # leaked into the transparency baseline.
+          pip install -e ".[dev]"
+          python -m spacy download en_core_web_sm
+      - name: Assert the only runtime dependency is cloakllm
+        run: |
+          # The gateway reuses the SDK rather than reimplementing detection,
+          # and that is the whole dependency budget. Anything else appearing
+          # here is a vendored-logic smell.
           #
           # Reads the INSTALLED metadata rather than pyproject.toml: tomllib
           # is 3.11+ and this matrix starts at 3.10, and the built metadata
-          # is the thing a user actually resolves anyway.
+          # is what a user actually resolves anyway.
           python - <<'PY'
-          import sys
+          import re, sys
           from importlib.metadata import requires
           runtime = [r for r in (requires("cloakllm-mcp-gateway") or [])
                      if "extra ==" not in r]
-          if runtime:
+          names = sorted(re.split(r"[\s\[<>=!;]", r, 1)[0] for r in runtime)
+          if names != ["cloakllm"]:
               sys.exit("::error::unexpected runtime dependencies: %r" % runtime)
-          print("confirmed: zero runtime dependencies")
+          print("confirmed: runtime deps are exactly %r" % runtime)
           PY
       - name: Run tests
         run: pytest tests/ -v
@@ -80,12 +83,14 @@ jobs:
         with:
           node-version: 22
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          pip install -e ".[dev]"
+          python -m spacy download en_core_web_sm
       - name: Install a real MCP server
         working-directory: tests/acceptance
         run: |
           echo '{"name":"acceptance","version":"1.0.0","private":true}' > package.json
           npm install @modelcontextprotocol/server-filesystem
-      - name: Real-server transparency diff
+      - name: Real-server diff, transparent and protecting
         working-directory: tests/acceptance
-        run: python m0_real_server.py
+        run: python real_server.py

@@ -44,6 +44,12 @@ class GatewayHarness:
                     name, opts["command"], opts.get("args", [])))
             else:
                 specs.append(config_mod.UpstreamSpec(name, sys.executable, args))
+        # Sanitization defaults OFF *in the harness* -- the opposite of the
+        # product default, which test_config asserts separately. The M0
+        # suite is about transparency and would be measuring the sanitizer
+        # instead, and building a detection model for each of ~35 tests
+        # costs seconds apiece. M1 tests opt in explicitly.
+        options.setdefault("sanitize", False)
         self.config = config_mod.GatewayConfig(specs, **options)
 
         r_in, w_in = os.pipe()

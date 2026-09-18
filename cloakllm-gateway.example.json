@@ -13,5 +13,10 @@
     }
   },
   "log_level": "info",
-  "request_timeout": 120
+  "request_timeout": 120,
+
+  "sanitize": true,
+  "detection": {
+    "detect_ip_addresses": false
+  }
 }

@@ -19,18 +19,25 @@ classifiers = [
     "Topic :: Security",
 ]
 
-# M0 is pure plumbing and deliberately has no runtime dependencies -- it is a
-# JSON-RPC proxy and nothing more. cloakllm itself arrives at M1, when there
-# is something to sanitize with it. Keeping the dependency out until then
-# means the transparency baseline cannot be contaminated by the SDK's own
-# behaviour.
-dependencies = []
+# The cap moves with the floor. A "<next-minor" cap that stays behind while
+# the floor rises blocks its own fix -- this project has been bitten twice,
+# most recently by a cryptography cap that blocked the CVE fix for itself.
+dependencies = [
+    "cloakllm>=0.12.2,<0.13.0",
+]
 
 [project.optional-dependencies]
+# NER (PERSON / ORG / GPE) is a separate install, matching the SDK's own
+# split. It is genuinely a trade-off here rather than a free win: in a proxy
+# a false positive tokenizes a value the model needed, so an operator who
+# only wants high-confidence regex categories should not be made to carry
+# spaCy.
+detection = ["cloakllm[detection]>=0.12.2,<0.13.0"]
 dev = [
     "pytest>=7.0",
     "bandit>=1.7",
     "pip-audit>=2.7",
+    "cloakllm[detection]>=0.12.2,<0.13.0",
 ]
 
 [project.scripts]

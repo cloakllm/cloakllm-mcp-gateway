@@ -1,8 +1,15 @@
-"""M0 acceptance against a REAL MCP server, measured rather than eyeballed.
+"""Acceptance against a REAL MCP server, measured rather than eyeballed.
 
-"Cannot tell the difference" is only a claim until you run the same session
-twice -- once straight at @modelcontextprotocol/server-filesystem, once at
-the same server through the gateway -- and diff the two transcripts.
+The same session is run three ways -- straight at
+@modelcontextprotocol/server-filesystem, through the gateway with
+sanitization off, and through the gateway with it on -- and the transcripts
+are diffed.
+
+Running all three is what makes either claim checkable. The transparent pass
+proves the gateway changes nothing it did not mean to change; the protecting
+pass proves the one thing it does change is the PII. Neither is worth much
+alone: a gateway that mangles everything would pass the second, and one that
+does nothing would pass the first.
 
 The fake upstream in tests/ is a mock, so it shares the assumptions of the
 code it is testing. This does not -- and it earned its keep immediately: the
@@ -13,7 +20,7 @@ Kept out of the default pytest run because it needs a node_modules. To run:
 
     cd tests/acceptance
     npm install @modelcontextprotocol/server-filesystem
-    python m0_real_server.py
+    python real_server.py
 """
 import json
 import os
@@ -91,11 +98,13 @@ class Peer:
             if got.get("id") == self._n:
                 return got
 
-    def initialize(self):
+    def initialize(self, timeout=60):
+        # The guarded gateway loads a detection model and runs a startup
+        # self-test before it answers, so this needs real headroom.
         r = self.request("initialize", {
             "protocolVersion": PROTOCOL,
             "capabilities": {"roots": {"listChanged": True}},
-            "clientInfo": {"name": "m0-acceptance", "version": "1.0"}})
+            "clientInfo": {"name": "acceptance", "version": "1.0"}}, timeout=timeout)
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return r
 
@@ -107,21 +116,32 @@ class Peer:
             self.proc.kill()
 
 
+PLANTED = {
+    "email": "marie.dubois@example-eu.fr",
+    "card": "5500 0000 0000 0004",
+    "iban": "FR76 3000 6000 0112 3456 7890 189",
+}
+# Must survive: a gateway that tokenizes these has taken away the model's
+# ability to answer, for no privacy gain -- nobody is identified by "France".
+MUST_SURVIVE = ("France", "Acme Corp", "quarterly report")
+
+
 def setup_sandbox():
     os.makedirs(SANDBOX, exist_ok=True)
-    # A planted value, so M1 has something concrete to change. At M0 it must
-    # arrive verbatim; at M1 it must arrive as [EMAIL_0].
-    with open(os.path.join(SANDBOX, "customer.txt"), "w", encoding="utf-8") as fh:
-        fh.write("Customer marie.dubois@example-eu.fr called about card "
-                 "5500 0000 0000 0004.\n")
-    return os.path.join(SANDBOX, "customer.txt")
+    path = os.path.join(SANDBOX, "customer.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("Customer %(email)s called about card %(card)s.\n"
+                 "Billing IBAN %(iban)s.\n" % PLANTED)
+        fh.write("Acme Corp filed its quarterly report in France.\n")
+    return path
 
 
-def write_config(path):
+def write_config(path, sanitize):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({
             "upstreams": {"fs": {"command": "node", "args": [FS_SERVER, SANDBOX]}},
             "log_level": "warn",
+            "sanitize": sanitize,
         }, fh)
 
 
@@ -133,9 +153,9 @@ def main():
 
     planted_file = setup_sandbox()
     cfg = os.path.join(HERE, "gw.json")
-    write_config(cfg)
+    write_config(cfg, sanitize=False)
 
-    print("\nM0 acceptance: @modelcontextprotocol/server-filesystem")
+    print("\nAcceptance: @modelcontextprotocol/server-filesystem")
     print("   direct  : node %s" % os.path.basename(FS_SERVER))
     print("   gateway : python -m cloakllm_gateway -> the same server\n")
 
@@ -197,11 +217,11 @@ def main():
               (d_read.get("result"), g_read.get("result")))
 
         text = json.dumps(g_read.get("result"))
-        # M0 is transparent BY DESIGN, so the planted PII must still be here.
-        # This assertion inverts at M1 and is the single clearest marker of
-        # the milestone boundary.
-        check("M0 baseline: planted PII passes through untouched (inverts at M1)",
-              "marie.dubois@example-eu.fr" in text, text[:200])
+        # With sanitization off the gateway is a plain proxy, so the planted
+        # PII must still be here. This is also what makes the protecting
+        # pass below meaningful: it proves the probe can see a leak.
+        check("transparent mode: planted PII passes through untouched",
+              PLANTED["email"] in text, text[:200])
 
         print("\n4. error paths and unknown tools")
         d_err = direct.request("tools/call", {
@@ -239,9 +259,66 @@ def main():
 
     finally:
         gw.close()
+
+    # --------------------------------------------------------- protecting
+    print("\n7. sanitization ON -- the same real file, through the gateway")
+    write_config(cfg, sanitize=True)
+    guarded = Peer([sys.executable, "-m", "cloakllm_gateway", "--config", cfg],
+                   cwd=GATEWAY_REPO)
+    try:
+        init = guarded.initialize(timeout=180)
+        check("gateway starts with sanitization enabled", "result" in init, init)
+
+        read = guarded.request("tools/call", {
+            "name": "fs__read_text_file", "arguments": {"path": planted_file}},
+            timeout=120)
+        check("guarded read succeeded", "result" in read, read)
+        body = json.dumps(read.get("result"))
+
+        for label, value in PLANTED.items():
+            check("%s is gone from the model's view" % label, value not in body,
+                  body[:300])
+            digits = "".join(c for c in value if c.isdigit())
+            if len(digits) >= 8:
+                check("%s is gone in digits-only form too" % label,
+                      digits not in "".join(c for c in body if c.isdigit()))
+
+        check("and it was replaced by a token, not merely dropped",
+              "[EMAIL_0]" in body, body[:300])
+
+        # The other half of the trade-off. A gateway that tokenizes
+        # everything would pass every check above and be useless.
+        for keep in MUST_SURVIVE:
+            check("%r still reaches the model" % keep, keep in body, body[:300])
+
+        # Schemas are not data: rewriting a tool description or an enum
+        # inside an inputSchema corrupts the contract the model calls
+        # against, for no privacy gain.
+        guarded_tools = guarded.request("tools/list", timeout=60)["result"]["tools"]
+        stripped_guarded = []
+        for tool in guarded_tools:
+            copy = dict(tool)
+            copy["name"] = tool["name"][len("fs__"):]
+            stripped_guarded.append(copy)
+        check("tools/list is still byte-identical with sanitization on",
+              json.dumps(sorted(stripped_guarded, key=lambda t: t["name"]), sort_keys=True)
+              == json.dumps(sorted(d_tools, key=lambda t: t["name"]), sort_keys=True))
+
+        # A failed call must not leak what a successful one would have: the
+        # real server echoes the requested path into its error message.
+        leaky_path = os.path.join(SANDBOX, "%s.txt" % PLANTED["email"])
+        err = guarded.request("tools/call", {
+            "name": "fs__read_text_file", "arguments": {"path": leaky_path}},
+            timeout=60)
+        check("the error path does not leak the address in the filename",
+              PLANTED["email"] not in json.dumps(err), json.dumps(err)[:300])
+
+        check("still responsive", "result" in guarded.request("ping", timeout=30))
+    finally:
+        guarded.close()
         direct.close()
 
-    print("\nM0 acceptance: %s"
+    print("\nAcceptance: %s"
           % ("FAILED -- " + "; ".join(fails) if fails else "all checks passed"))
     return 1 if fails else 0
 
