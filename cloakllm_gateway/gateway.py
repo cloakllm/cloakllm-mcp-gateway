@@ -202,12 +202,57 @@ class Gateway:
             self._workers.submit(self._guarded, msg_id, self._handle_set_level, msg)
             return
 
-        target = self._route(method, msg.get("params") or {})
+        # Desanitize BEFORE routing. The model holds tokenized URIs, and the
+        # resource index holds the real ones, so routing a request on its
+        # tokenized form would never find an owner.
+        params = msg.get("params") or {}
+        if self._session is not None:
+            # Order matters, and getting it wrong makes the warning
+            # useless: run the detector BEFORE restoring tokens. Afterwards
+            # every round-tripped value is indistinguishable from something
+            # the model invented, so the warning would fire on completely
+            # normal operation and be trained away within a day.
+            self._warn_on_fresh_pii(method, params)
+            try:
+                params, _ = self._session.desanitize_payload(params)
+            except sanitizer.SanitizationFailed as exc:
+                log.error("could not restore tokens in a %s request: %s"
+                          % (method, exc))
+                self._client.write(jsonrpc.error_response(
+                    msg_id, jsonrpc.INTERNAL_ERROR,
+                    "cloakllm-gateway could not restore the tokens in this "
+                    "%s request and refused to forward it" % method))
+                return
+
+        target = self._route(method, params)
         if isinstance(target, dict):          # a prepared error
             self._client.write(jsonrpc.error_response(msg_id, **target))
             return
         upstream, params = target
         self._forward_client_request(upstream, msg, params)
+
+    def _warn_on_fresh_pii(self, method, params):
+        """Surface PII the model wrote out itself, rather than a token.
+
+        Called on the request BEFORE tokens are restored, which is the only
+        point at which the distinction exists: a token is not PII, so
+        anything the detector finds here is something the model produced.
+
+        A raw address the model wrote is worth surfacing because the
+        gateway cannot tell a filesystem server on the same machine from a
+        third-party server that happens to speak MCP -- the operator is the
+        only one who can judge that. Detection only; nothing is blocked.
+        """
+        try:
+            found = self._session.detect_outbound(params)
+        except Exception as exc:  # noqa: BLE001 - a warning must never break a call
+            log.debug("outbound detection failed for %s: %r" % (method, exc))
+            return
+        if found:
+            log.warn("%s carries PII the model wrote out itself, not a token "
+                     "(%s). It is being sent to the upstream as-is."
+                     % (method, ", ".join("%s x%d" % kv
+                                          for kv in sorted(found.items()))))
 
     def _guarded(self, msg_id, fn, msg):
         """Run a blocking handler on a worker, answering the client either way."""
@@ -481,7 +526,12 @@ class Gateway:
         # is walked and the merged list returned whole, so there is no cursor
         # for the client to hold that would have to mean different offsets in
         # several upstreams at once.
-        self._client.write(jsonrpc.result_response(msg["id"], {key: merged}))
+        #
+        # Sanitization happens AFTER _namespace_item has indexed the real
+        # URIs, so the routing index keeps the values an upstream will
+        # recognise while the model only ever sees the tokenized ones.
+        self._client.write(self._sanitize_response(
+            jsonrpc.result_response(msg["id"], {key: merged}), method, None))
 
     def _list_all(self, up, method, key):
         items = []
@@ -625,6 +675,19 @@ class Gateway:
             return
         restored = dict(msg)
         restored["id"] = original_id
+        # The model's answer to a sampling request goes to a real server, so
+        # it needs real values -- the same round trip as a tool argument.
+        if self._session is not None and "result" in restored:
+            try:
+                restored["result"], _ = self._session.desanitize_payload(
+                    restored["result"])
+            except sanitizer.SanitizationFailed as exc:
+                log.error("%s: could not restore tokens in a sampling "
+                          "response: %s" % (name, exc))
+                up.send(jsonrpc.error_response(
+                    original_id, jsonrpc.INTERNAL_ERROR,
+                    "cloakllm-gateway could not restore tokens in this response"))
+                return
         up.send(restored)
 
     # ----------------------------------------------------- upstream inbound
@@ -646,16 +709,30 @@ class Gateway:
             return
 
         if jsonrpc.is_request(msg):
-            # sampling/createMessage, roots/list, elicitation/create.
-            # Forwarded raw in M0; sampling carries content and is one of the
-            # five PII paths the plan enumerates.
+            # sampling/createMessage, roots/list, elicitation/create. A
+            # server asking the client for a completion hands it content,
+            # and that content reaches the model exactly like a tool result
+            # does -- so it is sanitized on the same terms.
             gw_id = "u-%d" % next(self._ids)
             original = msg["id"]
+            forwarded = dict(msg)
+            forwarded["id"] = gw_id
+            if self._session is not None and "params" in forwarded:
+                try:
+                    forwarded["params"], _ = self._session.sanitize_payload(
+                        forwarded["params"])
+                except sanitizer.SanitizationFailed as exc:
+                    # Fail closed, towards the upstream this time: it gets
+                    # an error and the client never sees the payload.
+                    log.error("%s: could not sanitize a %s request: %s"
+                              % (up.name, msg.get("method"), exc))
+                    up.send(jsonrpc.error_response(
+                        original, jsonrpc.INTERNAL_ERROR,
+                        "cloakllm-gateway could not sanitize this request"))
+                    return
             with self._lock:
                 self._from_upstream[gw_id] = (up.name, original)
                 self._upstream_id_index[(up.name, _key(original))] = gw_id
-            forwarded = dict(msg)
-            forwarded["id"] = gw_id
             self._client.write(forwarded)
             return
 
@@ -687,7 +764,8 @@ class Gateway:
                 return msg
         except sanitizer.SanitizationFailed as exc:
             log.error("%s: sanitization failed for %s, refusing to forward "
-                      "the payload: %s" % (up.name, method, exc))
+                      "the payload: %s"
+                      % (up.name if up is not None else "gateway", method, exc))
             return jsonrpc.error_response(
                 msg.get("id"), jsonrpc.INTERNAL_ERROR,
                 "cloakllm-gateway could not sanitize this %s response and "
@@ -695,7 +773,8 @@ class Gateway:
 
         if stats.changed:
             log.info("%s: %s -- redacted %d of %d strings"
-                     % (up.name, method, stats.changed, stats.sanitized))
+                     % (up.name if up is not None else "gateway", method,
+                        stats.changed, stats.sanitized))
         return out
 
     def _on_upstream_notification(self, up, msg):

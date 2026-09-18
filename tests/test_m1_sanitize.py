@@ -151,13 +151,15 @@ def test_nested_and_unknown_fields_are_walked(harness):
 
 def test_identity_and_binary_fields_are_left_alone(harness):
     # These have to survive byte for byte or the protocol breaks: "type" is
-    # the content discriminator, "uri" is routing identity, "blob" is
-    # base64. They are counted as skips so M3's tripwire knows to scan them.
+    # the content discriminator, "blob" is base64. They are counted as
+    # skips so M3's tripwire knows which surfaces to scan.
+    #
+    # "uri" was in this set at M1 and is not any more: M2 added the return
+    # path that lets a tokenized URI be restored before routing.
     session = sanitizer.Session(sanitizer.build_shield({}))
     payload = {
         "type": "text",
         "mimeType": "text/plain",
-        "uri": "file:///home/%s/notes.txt" % PLANTED["email"],
         "blob": "aGVsbG8gd29ybGQ=",
         "text": "mail %s" % PLANTED["email"],
     }
@@ -165,23 +167,9 @@ def test_identity_and_binary_fields_are_left_alone(harness):
 
     assert out["type"] == "text"
     assert out["mimeType"] == "text/plain"
-    assert out["uri"] == payload["uri"], "routing identity must survive"
     assert out["blob"] == payload["blob"], "base64 must not be rewritten"
     assert PLANTED["email"] not in out["text"]
-    assert set(stats.skipped) == {"type", "mimeType", "uri", "blob"}
-
-
-def test_a_known_m1_gap_is_recorded_not_hidden(harness):
-    # Tokenizing a URI needs M2's return path to put it back, so at M1 a URI
-    # carrying PII still reaches the model. Asserting the gap keeps it
-    # honest: when M2 closes it, this test fails and has to be updated
-    # deliberately rather than the gap being forgotten.
-    session = sanitizer.Session(sanitizer.build_shield({}))
-    out, stats = session.sanitize_payload(
-        {"uri": "file:///home/%s/x.txt" % PLANTED["email"]})
-
-    assert PLANTED["email"] in out["uri"], "M1 gap: URIs are not yet tokenized"
-    assert stats.skipped == {"uri": 1}
+    assert set(stats.skipped) == {"type", "mimeType", "blob"}
 
 
 def test_non_string_scalars_survive(harness):
@@ -196,10 +184,13 @@ def test_non_string_scalars_survive(harness):
 def test_only_model_facing_methods_are_sanitized(harness):
     # tools/list carries schemas, not data. Rewriting a description or an
     # enum inside an inputSchema would corrupt the contract the model calls
-    # against, for no privacy gain.
+    # against, for no privacy gain. resources/list is the opposite case --
+    # a directory listing IS data -- and was added in M2.
     assert "tools/list" not in sanitizer.SANITIZED_METHODS
+    assert "prompts/list" not in sanitizer.SANITIZED_METHODS
     assert sanitizer.SANITIZED_METHODS == {
-        "tools/call", "resources/read", "prompts/get"}
+        "tools/call", "resources/read", "prompts/get",
+        "resources/list", "resources/templates/list"}
 
 
 def test_resource_reads_are_sanitized(harness):

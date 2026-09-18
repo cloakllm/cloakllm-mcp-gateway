@@ -34,15 +34,31 @@ from . import log
 IDENTITY_KEYS = frozenset({
     "type",           # the content-block discriminator; rewriting it breaks parsing
     "mimeType",
-    "uri",            # routing identity. Tokenizing these needs M2's return path
-    "uriTemplate",
     "progressToken",  # correlates a progress notification with its request
 })
 BINARY_KEYS = frozenset({"data", "blob"})
 SKIP_KEYS = IDENTITY_KEYS | BINARY_KEYS
 
+# uri and uriTemplate were in the skip set at M1, because tokenizing a URI
+# needs a return path to put it back and there was none. M2 added one, so
+# they are sanitized now: a URI is shown to the model like any other text
+# and "file:///home/marie.dubois@example-eu.fr/notes.txt" is exactly the
+# kind of thing this product exists to keep out of a provider's context.
+# Routing still works because the gateway desanitizes an inbound request
+# BEFORE it routes on it, and the resource index holds the real URIs.
+
 # The response methods whose payloads reach the model's context.
-SANITIZED_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+#
+# resources/list is here and tools/list is not, which looks inconsistent
+# until you look at what they carry. tools/list is schemas -- rewriting a
+# description or an inputSchema enum corrupts the contract the model calls
+# against, for no privacy gain. resources/list is a listing of real things:
+# on a filesystem server it is a directory listing, and filenames carry
+# names and addresses.
+SANITIZED_METHODS = frozenset({
+    "tools/call", "resources/read", "prompts/get",
+    "resources/list", "resources/templates/list",
+})
 
 
 class SanitizationFailed(Exception):
@@ -114,38 +130,80 @@ class Session:
         the caller can refuse the whole message rather than forward some of
         it unprotected.
         """
+        return self._transform(payload, self.sanitize_text, "sanitize")
+
+    def desanitize_payload(self, payload):
+        """Return a copy with tokens restored to the values they stand for.
+
+        This runs on the way OUT, towards a real MCP server, and it is what
+        makes the round trip work: the model reasons over [EMAIL_0] and the
+        tool still receives the address.
+
+        Note what this is and is not. Desanitizing here is a *functionality*
+        guarantee, not a privacy one -- the protection already happened when
+        the value was tokenized on the way in. The privacy question on this
+        leg is a different one, and _detect_outbound below is what asks it.
+        """
+        return self._transform(payload, self.desanitize_text, "desanitize")
+
+    def _transform(self, payload, fn, what):
         stats = Stats()
         try:
-            out = self._walk(payload, None, stats)
+            out = self._walk(payload, None, stats, fn)
         except Exception as exc:  # noqa: BLE001 - fail closed on anything
-            raise SanitizationFailed(str(exc)) from exc
+            raise SanitizationFailed("%s: %s" % (what, exc)) from exc
         if stats.skipped:
-            log.debug("left %s untouched (identity or binary fields)"
-                      % ", ".join("%s x%d" % (k, n)
-                                  for k, n in sorted(stats.skipped.items())))
+            log.debug("%s left %s untouched (identity or binary fields)"
+                      % (what, ", ".join("%s x%d" % (k, n)
+                                         for k, n in sorted(stats.skipped.items()))))
         return out, stats
 
-    def _walk(self, node, key, stats):
+    def _walk(self, node, key, stats, fn):
         if isinstance(node, str):
             stats.strings += 1
             if key in SKIP_KEYS:
                 stats.note_skip(key)
                 return node
             stats.sanitized += 1
-            out = self.sanitize_text(node)
+            out = fn(node)
             if out != node:
                 stats.changed += 1
             return out
         if isinstance(node, dict):
             # A copy, never a mutation: the caller may still hold the
             # original, and at M4 the audit hook will want the pre-image.
-            return {k: self._walk(v, k, stats) for k, v in node.items()}
+            return {k: self._walk(v, k, stats, fn) for k, v in node.items()}
         if isinstance(node, list):
             # Carry the parent key down so a list of strings under "data"
             # is still recognised as binary.
-            return [self._walk(v, key, stats) for v in node]
+            return [self._walk(v, key, stats, fn) for v in node]
         # bool / int / float / None carry no text.
         return node
+
+    def detect_outbound(self, payload):
+        """Report PII in an outbound payload that is NOT one of our tokens.
+
+        A token being restored here is the system working. A raw address the
+        model wrote out itself is something else, and worth surfacing:
+        upstreams are not all equal. A filesystem server on the same machine
+        receiving a real customer record is fine; a third-party search or
+        issue-tracker server receiving the same record is an exfiltration
+        path that happens to be shaped like a tool call, and the gateway has
+        no way to tell the two apart from the config alone.
+
+        Detection only -- nothing is blocked or rewritten. Per-upstream
+        trust, which is what would let this become enforcement, is a later
+        decision and needs the operator to declare it.
+        """
+        found = {}
+        for text in _strings(payload):
+            # A throwaway map on purpose: this is a probe, and it must not
+            # allocate tokens in the session the model is actually using.
+            with self._lock:
+                _, probe_map = self._shield.sanitize(text)
+            for category in _categories(probe_map):
+                found[category] = found.get(category, 0) + 1
+        return found
 
 
 # The SDK enables every NER label it knows: PERSON, ORG, GPE, LOC, NORP,
@@ -169,6 +227,27 @@ _SELF_TEST_PROBES = (
     ("detect_api_keys", "AKIAIOSFODNN7EXAMPLE"),
     ("detect_ssns", "123-45-6789"),
 )
+
+
+def _strings(node, key=None):
+    """Yield every string in a payload that the walker would have touched."""
+    if isinstance(node, str):
+        if key not in SKIP_KEYS:
+            yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from _strings(v, k)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings(v, key)
+
+
+def _categories(token_map):
+    """The category names a TokenMap found, however the SDK spells them."""
+    categories = getattr(token_map, "categories", None) or []
+    if isinstance(categories, dict):
+        return list(categories)
+    return list(categories)
 
 
 def self_test(session, detection_options):

@@ -18,19 +18,33 @@ The model never sees the PII; the downstream tool still works.
 
 ---
 
-## Status: M1 — tool results are sanitized. Not yet released.
+## Status: M2 — the round trip works. Not yet released.
 
-This is an early, unreleased repo. **PII flowing *from* a server to the model is
-removed; PII the model sends back in tool arguments is not yet restored, so the
-round trip is incomplete.** Do not deploy it in anger yet.
+This is an early, unreleased repo. **The full loop is closed: the model sees
+`[EMAIL_0]`, the downstream tool receives the real address.** The remaining
+milestones are the leak-probe gate and the audit chain, and the release gate is
+M3 — so do not deploy this in anger yet.
 
 | Milestone | State |
 |---|---|
 | **M0** — transparent proxy, zero logic | **done** |
 | **M1** — sanitize tool results | **done** |
-| M2 — desanitize tool arguments | not started |
+| **M2** — desanitize tool arguments | **done** |
 | M3 — deny-by-default walker + tripwire (**release gate**) | not started |
 | M4 — hash-chained audit log | not started |
+
+The round trip is proved against a real server, on disk rather than through the
+gateway. The acceptance run has the model write a file whose content is the
+token `[EMAIL_0]`, then opens that file directly:
+
+```
+model sent to the tool:  Contact: [EMAIL_0]
+what landed on disk:     Contact: marie.dubois@example-eu.fr
+```
+
+Reading it back through the gateway would have proved nothing — a result is
+re-sanitized on the way out, so "restored correctly" and "never restored at
+all" look identical from there.
 
 Behaviour is measured against a real third-party server, not asserted.
 `tests/acceptance/real_server.py` runs the same session three ways — straight at
@@ -44,28 +58,44 @@ proves the one thing it changes is the PII. Neither is worth much alone — a
 gateway that mangled everything would pass the second, and one that did nothing
 would pass the first.
 
-### What M1 does and does not touch
+### What is sanitized, and what deliberately is not
 
-Sanitized: `tools/call`, `resources/read` and `prompts/get` payloads — results
-**and** JSON-RPC error bodies, because the real filesystem server puts the
-requested path in its "file not found" message, so a failed call leaks exactly
-what a successful one would have.
+**Towards the model** — `tools/call`, `resources/read`, `prompts/get`,
+`resources/list`, `resources/templates/list`, and `sampling/createMessage`
+requests an upstream makes of the client. Results **and** JSON-RPC error
+bodies: the real filesystem server puts the requested path in its "file not
+found" message, so a failed call leaks exactly what a successful one would.
 
-Not sanitized: `tools/list` and the other schema-bearing responses. Rewriting a
-tool description or an enum inside an `inputSchema` corrupts the contract the
-model calls against, for no privacy gain.
+**Towards the upstream** — `tools/call` arguments and sampling answers have
+their tokens restored, so the tool receives real values.
 
-The walker **sanitizes every string by default** and skips only a small,
-principled set — `type`, `mimeType`, `uri`, `uriTemplate`, `progressToken`,
-`data`, `blob` — all of them protocol discriminators, routing identities or
-base64 binary, whose exact bytes must survive. A field this gateway has never
-heard of is therefore sanitized, not ignored. Every skip is counted, so M3's
-tripwire has an explicit list of surfaces to scan.
+**Not touched:** `tools/list` and `prompts/list`. Those carry schemas.
+Rewriting a description or an enum inside an `inputSchema` corrupts the
+contract the model calls against, for no privacy gain. `resources/list` is the
+opposite case and *is* sanitized — a directory listing is data, and filenames
+carry names and addresses.
 
-**Known M1 gap, recorded rather than hidden:** a `uri` carrying PII still
-reaches the model, because tokenizing one needs M2's return path to put it back.
-A test asserts the gap, so closing it in M2 has to be a deliberate act rather
-than something anyone remembers to do.
+The walker **sanitizes every string by default** and skips only `type`,
+`mimeType`, `progressToken`, `data` and `blob` — protocol discriminators,
+correlation identities and base64 binary, whose exact bytes must survive. A
+field this gateway has never heard of is therefore sanitized, not ignored.
+Every skip is counted, so M3's tripwire has an explicit list of surfaces.
+
+### Two things worth knowing about the round trip
+
+**A hostile upstream cannot harvest values with a fake token.** A third-party
+server can return text containing a literal `[EMAIL_0]`, hoping the model
+quotes it into a later call so the gateway substitutes a real address into a
+payload bound for the attacker. The SDK's token-injection escaping rewrites
+brackets in upstream content to fullwidth ones, so what the model sees is not a
+token and never resolves. There is a test for it.
+
+**PII the model writes out itself is reported, not blocked.** A restored token
+is the system working; a raw address the model produced is something else. The
+gateway logs it and does nothing more, because it cannot tell a filesystem
+server on the same machine from a third-party server that happens to speak MCP
+— only the operator can. Per-upstream trust is the design that would turn this
+into enforcement, and it is not built.
 
 ### Detection defaults
 

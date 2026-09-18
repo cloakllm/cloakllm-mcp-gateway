@@ -313,6 +313,35 @@ def main():
         check("the error path does not leak the address in the filename",
               PLANTED["email"] not in json.dumps(err), json.dumps(err)[:300])
 
+        print("\n8. the round trip -- checked on disk, not through the gateway")
+        # Every check so far reads what came back THROUGH the gateway, which
+        # cannot distinguish "the tool got the real value" from "the token
+        # was never restored and got re-tokenized on the way back". This one
+        # reads the file the real server actually wrote.
+        token = None
+        for candidate in ("[EMAIL_0]", "[EMAIL_1]"):
+            if candidate in body:
+                token = candidate
+                break
+        check("the model was given a token it can refer back to", token is not None,
+              body[:300])
+
+        if token:
+            out_path = os.path.join(SANDBOX, "roundtrip.txt")
+            wrote = guarded.request("tools/call", {
+                "name": "fs__write_file",
+                "arguments": {"path": out_path,
+                              "content": "Contact: %s\n" % token}}, timeout=120)
+            check("the write call succeeded", "result" in wrote, wrote)
+
+            on_disk = ""
+            if os.path.isfile(out_path):
+                with open(out_path, encoding="utf-8") as fh:
+                    on_disk = fh.read()
+            check("THE ROUND TRIP: the real server wrote the real address",
+                  PLANTED["email"] in on_disk, repr(on_disk))
+            check("and not the token", token not in on_disk, repr(on_disk))
+
         check("still responsive", "result" in guarded.request("ping", timeout=30))
     finally:
         guarded.close()
